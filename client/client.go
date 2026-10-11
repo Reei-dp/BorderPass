@@ -104,6 +104,58 @@ func runClientSession(ctx context.Context, conn net.Conn, cfg *config.Config, in
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 
+	// Initialize UDP fast-path for ultra-low latency mouse movements
+	serverHost, serverPort, err := net.SplitHostPort(conn.RemoteAddr().String())
+	if err == nil {
+		serverUDPAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(serverHost, serverPort))
+		if err == nil {
+			udpConn, err := net.DialUDP("udp", nil, serverUDPAddr)
+			if err == nil {
+				defer udpConn.Close()
+				fmt.Printf("[Client] UDP fast-path connected to %s\n", serverUDPAddr.String())
+
+				sendUDPHeartbeat := func() {
+					pkt := protocol.Packet{Type: protocol.TypeHeartbeat}
+					hdr := pkt.EncodeHeader()
+					_, _ = udpConn.Write(hdr[:])
+				}
+				sendUDPHeartbeat()
+
+				// Background UDP heartbeat to maintain router NAT state
+				go func() {
+					ticker := time.NewTicker(1 * time.Second)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						case <-stopCh:
+							return
+						case <-ticker.C:
+							sendUDPHeartbeat()
+						}
+					}
+				}()
+
+				// Background ultra-low latency UDP mouse movement receiver
+				go func() {
+					var buf [protocol.HeaderSize]byte
+					for {
+						n, err := udpConn.Read(buf[:])
+						if err != nil {
+							return
+						}
+						if n == protocol.HeaderSize && buf[0] == protocol.TypeMouseMove {
+							pkt := protocol.DecodeHeader(buf)
+							telemetry.Global.IncRecv()
+							_ = injector.MoveMouse(pkt.Value, pkt.Extra)
+						}
+					}
+				}()
+			}
+		}
+	}
+
 	currentPosition := cfg.Position
 	var posMu sync.Mutex
 	var lastReleaseTime time.Time

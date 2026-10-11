@@ -54,6 +54,17 @@ func (p *Packet) EncodeHeader() [HeaderSize]byte {
 	return buf
 }
 
+// DecodeHeader deserializes a 16-byte fixed header without allocations
+func DecodeHeader(buf [HeaderSize]byte) Packet {
+	return Packet{
+		Type:  buf[0],
+		Flags: buf[1],
+		Code:  binary.LittleEndian.Uint16(buf[2:4]),
+		Value: int32(binary.LittleEndian.Uint32(buf[4:8])),
+		Extra: int32(binary.LittleEndian.Uint32(buf[8:12])),
+	}
+}
+
 // SendPacket transmits a packet over a network connection
 func SendPacket(conn net.Conn, p Packet) error {
 	header := p.EncodeHeader()

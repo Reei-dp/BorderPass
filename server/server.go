@@ -50,6 +50,33 @@ func RunServer(ctx context.Context, cfg *config.Config) error {
 	}
 	defer listener.Close()
 
+	var hub *udpHub
+	udpAddr, err := net.ResolveUDPAddr("udp", listenAddr)
+	if err == nil {
+		uConn, err := net.ListenUDP("udp", udpAddr)
+		if err == nil {
+			hub = &udpHub{conn: uConn}
+			defer uConn.Close()
+			go func() {
+				<-ctx.Done()
+				_ = uConn.Close()
+			}()
+
+			go func() {
+				var buf [protocol.HeaderSize]byte
+				for {
+					n, rAddr, err := uConn.ReadFromUDP(buf[:])
+					if err != nil {
+						return
+					}
+					if n == protocol.HeaderSize {
+						hub.handleIncoming(rAddr)
+					}
+				}
+			}()
+		}
+	}
+
 	telemetry.Global.SetStatus("LISTENING", cfg.Address)
 	telemetry.Global.SetControl("HOST (LOCAL)")
 
@@ -71,11 +98,55 @@ func RunServer(ctx context.Context, cfg *config.Config) error {
 			}
 		}
 
-		handleClient(ctx, conn, cfg, capturer)
+		handleClient(ctx, conn, cfg, capturer, hub)
 	}
 }
 
-func handleClient(ctx context.Context, conn net.Conn, cfg *config.Config, capturer platform.Capturer) {
+type udpHub struct {
+	conn             *net.UDPConn
+	mu               sync.RWMutex
+	clientUDPAddr    *net.UDPAddr
+	expectedClientIP string
+}
+
+func (h *udpHub) setExpectedClient(ip string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.expectedClientIP = ip
+	h.clientUDPAddr = nil
+}
+
+func (h *udpHub) clearClient() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.expectedClientIP = ""
+	h.clientUDPAddr = nil
+}
+
+func (h *udpHub) getTarget() *net.UDPAddr {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.clientUDPAddr
+}
+
+func (h *udpHub) handleIncoming(rAddr *net.UDPAddr) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.expectedClientIP == "" {
+		return
+	}
+	rIP := rAddr.IP.String()
+	p1 := net.ParseIP(rIP)
+	p2 := net.ParseIP(h.expectedClientIP)
+	if (p1 != nil && p2 != nil && p1.Equal(p2)) || rIP == h.expectedClientIP {
+		if h.clientUDPAddr == nil {
+			fmt.Printf("[Server] UDP fast-path active with client: %s\n", rAddr.String())
+		}
+		h.clientUDPAddr = rAddr
+	}
+}
+
+func handleClient(ctx context.Context, conn net.Conn, cfg *config.Config, capturer platform.Capturer, hub *udpHub) {
 	defer conn.Close()
 	defer capturer.Ungrab()
 	defer telemetry.Global.SetStatus("LISTENING", cfg.Address)
@@ -89,6 +160,12 @@ func handleClient(ctx context.Context, conn net.Conn, cfg *config.Config, captur
 
 	remoteAddr := conn.RemoteAddr().String()
 	telemetry.Global.SetStatus("CONNECTED", remoteAddr)
+
+	clientTCPHost, _, _ := net.SplitHostPort(remoteAddr)
+	if hub != nil {
+		hub.setExpectedClient(clientTCPHost)
+		defer hub.clearClient()
+	}
 
 	var sendMu sync.Mutex
 	safeSend := func(pkt protocol.Packet) error {
@@ -271,11 +348,29 @@ func handleClient(ctx context.Context, conn net.Conn, cfg *config.Config, captur
 						}
 					}
 				} else {
-					_ = safeSend(protocol.Packet{
-						Type:  protocol.TypeMouseMove,
-						Value: dx,
-						Extra: dy,
-					})
+					sentUDP := false
+					if hub != nil && hub.conn != nil {
+						target := hub.getTarget()
+						if target != nil {
+							pkt := protocol.Packet{
+								Type:  protocol.TypeMouseMove,
+								Value: dx,
+								Extra: dy,
+							}
+							hdr := pkt.EncodeHeader()
+							if _, err := hub.conn.WriteToUDP(hdr[:], target); err == nil {
+								telemetry.Global.IncSent()
+								sentUDP = true
+							}
+						}
+					}
+					if !sentUDP {
+						_ = safeSend(protocol.Packet{
+							Type:  protocol.TypeMouseMove,
+							Value: dx,
+							Extra: dy,
+						})
+					}
 				}
 
 			case platform.EventMouseButton:

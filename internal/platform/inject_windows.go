@@ -3,6 +3,7 @@
 package platform
 
 import (
+	"syscall"
 	"unsafe"
 
 	"borderpass/config"
@@ -10,6 +11,9 @@ import (
 )
 
 var (
+	winmm                = syscall.NewLazyDLL("winmm.dll")
+	procTimeBeginPeriod  = winmm.NewProc("timeBeginPeriod")
+	procTimeEndPeriod    = winmm.NewProc("timeEndPeriod")
 	procSendInput        = user32.NewProc("SendInput")
 	procGetCursorPos     = user32.NewProc("GetCursorPos")
 	procSetCursorPos     = user32.NewProc("SetCursorPos")
@@ -77,6 +81,8 @@ type windowsInjector struct{}
 
 // NewInjector creates an Injector for Windows
 func NewInjector(cfg *config.Config) (Injector, error) {
+	// Request 1ms timer resolution for ultra-low latency input processing
+	procTimeBeginPeriod.Call(1)
 	return &windowsInjector{}, nil
 }
 
@@ -201,6 +207,7 @@ func (w *windowsInjector) GetScreenSize() (int32, int32, error) {
 }
 
 func (w *windowsInjector) Close() error {
+	procTimeEndPeriod.Call(1)
 	return nil
 }
 
